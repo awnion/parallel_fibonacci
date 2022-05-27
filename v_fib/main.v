@@ -14,13 +14,9 @@ fn fib_cpu(n u64) u64 {
 
 fn fib(n u64) u64 {
 	if n > 30 {
-		ch := chan u64{}
-		go fn (ch chan u64, n u64) {
-			ch <- fib(n - 1)
-		}(ch, n)
-
+		tr := go fib(n - 1)
 		r := fib(n - 2)
-		l := <-ch
+		l := tr.wait()
 		return l + r
 	} else {
 		return fib_cpu(n)
