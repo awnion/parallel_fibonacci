@@ -1,2 +1,3 @@
-# parallel_fibonacci
+# Parallel Fibonacci numbers
+
 Multiple language implementation of Fibonacci numbers
