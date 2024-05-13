@@ -8,3 +8,10 @@ version = "0.1.0"
 [dependencies]
 async-recursion = "^1"
 tokio = {version = "^1", features = ["full"]}
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "fib_benchmark"
+harness = false
