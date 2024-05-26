@@ -1,6 +1,6 @@
-import gleam/erlang/process
 import gleam/int
 import gleam/io
+import gleam/otp/task
 
 pub fn fib_cpu(n: Int) -> Int {
   case n {
@@ -13,22 +13,14 @@ pub fn fib_cpu(n: Int) -> Int {
 pub fn fib(n: Int) -> Int {
   case n {
     _ if n > 30 -> {
-      let subject = process.new_subject()
-
-      process.start(fn() { process.send(subject, fib(n - 1)) }, False)
-
-      let y: Int = fib(n - 2)
-
-      case process.receive(subject, 999_999) {
-        Ok(x) -> x + y
-        Error(_) -> panic as "something broke :("
-      }
+      let t = task.async(fn() { fib(n - 1) })
+      fib(n - 2) + task.await_forever(t)
     }
     n -> fib_cpu(n)
   }
 }
 
 pub fn main() {
-  let n: Int = 45
-  io.println("fib(" <> int.to_string(n) <> ") = " <> int.to_string(fib_cpu(n)))
+  let n = 52
+  io.println("fib(" <> int.to_string(n) <> ") = " <> int.to_string(fib(n)))
 }
