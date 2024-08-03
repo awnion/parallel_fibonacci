@@ -8,6 +8,8 @@ version = "0.1.0"
 [dependencies]
 async-recursion = "1.1.1"
 tokio = {version = "1.37.0", features = ["full"]}
+rayon = "*"
+kanal = "0.1.0-pre8"
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports", "async_tokio"] }

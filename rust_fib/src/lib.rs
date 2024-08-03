@@ -26,3 +26,31 @@ pub fn fib2(n: u64) -> impl std::future::Future<Output = u64> + Send {
         }
     }
 }
+
+pub fn fib3(n: u64) -> u64 {
+    use std::sync::mpsc::channel;
+    if n > 30 {
+        let (sender, receiver) = channel();
+        std::thread::spawn(move || {
+            sender.send(fib3(n - 1)).unwrap();
+        });
+        let b = fib3(n - 2);
+        receiver.recv().unwrap() + b
+    } else {
+        fib_cpu(n)
+    }
+}
+
+pub fn fib4(n: u64) -> u64 {
+    use kanal::unbounded as channel;
+    if n > 30 {
+        let (sender, receiver) = channel();
+        std::thread::spawn(move || {
+            sender.send(fib4(n - 1)).unwrap();
+        });
+        let b = fib4(n - 2);
+        receiver.recv().unwrap() + b
+    } else {
+        fib_cpu(n)
+    }
+}
