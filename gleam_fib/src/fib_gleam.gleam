@@ -2,7 +2,7 @@ import gleam/int
 import gleam/io
 import gleam/otp/task
 
-pub fn fib_cpu(n: Int) -> Int {
+fn fib_cpu(n: Int) -> Int {
   case n {
     0 -> 0
     1 -> 1
@@ -10,7 +10,7 @@ pub fn fib_cpu(n: Int) -> Int {
   }
 }
 
-pub fn fib(n: Int) -> Int {
+fn fib(n: Int) -> Int {
   case n {
     _ if n > 30 -> {
       let t = task.async(fn() { fib(n - 1) })
