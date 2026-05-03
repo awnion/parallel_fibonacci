@@ -1,0 +1,6 @@
+[package]
+name = "rust_wasm_fib_guest_fail_child"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

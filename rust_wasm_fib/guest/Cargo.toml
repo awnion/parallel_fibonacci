@@ -1,0 +1,9 @@
+[package]
+name = "rust_wasm_fib_guest"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-executor.workspace = true
+async-recursion.workspace = true
+futures-lite.workspace = true
