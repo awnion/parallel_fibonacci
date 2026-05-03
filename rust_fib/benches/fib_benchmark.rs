@@ -1,5 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rust_fib::{fib, fib2, fib3, fib4};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
+use rust_fib::{fib, fib2, fib3, fib4, fib5};
 use tokio::runtime::Builder;
 
 fn criterion_benchmark(c: &mut Criterion) {
@@ -21,6 +23,8 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function(format!("fib3 {size}").as_str(), |b| b.iter(|| fib3(size)));
 
     c.bench_function(format!("fib4 {size}").as_str(), |b| b.iter(|| fib4(size)));
+
+    c.bench_function(format!("fib5 {size}").as_str(), |b| b.iter(|| fib5(size)));
 }
 
 criterion_group!(benches, criterion_benchmark);

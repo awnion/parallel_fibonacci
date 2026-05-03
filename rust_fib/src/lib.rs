@@ -54,3 +54,12 @@ pub fn fib4(n: u64) -> u64 {
         fib_cpu(n)
     }
 }
+
+pub fn fib5(n: u64) -> u64 {
+    if n > 30 {
+        let (a, b) = rayon::join(|| fib5(n - 1), || fib5(n - 2));
+        a + b
+    } else {
+        fib_cpu(n)
+    }
+}

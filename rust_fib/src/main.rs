@@ -7,7 +7,7 @@ async fn main() {
     let mode = args.get(2).map(|s| s.as_str()).unwrap_or("tokio");
 
     let result = match mode {
-        "threads" => rust_fib::fib3(n),
+        "threads" => rust_fib::fib5(n),
         _ => rust_fib::fib(n).await,
     };
 
