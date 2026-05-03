@@ -1,6 +1,10 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"strconv"
+)
 
 func fib_cpu(n uint64) uint64 {
 	switch n {
@@ -27,6 +31,11 @@ func fib(n uint64) uint64 {
 }
 
 func main() {
-	const n = 52
+	n := uint64(52)
+	if len(os.Args) > 1 {
+		if v, err := strconv.ParseUint(os.Args[1], 10, 64); err == nil {
+			n = v
+		}
+	}
 	fmt.Printf("Fib %v = %v\n", n, fib(n))
 }
