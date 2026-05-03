@@ -5,6 +5,10 @@ const DEFAULT_BURN_ITERS: u64 = 1_700_000;
 static BURN_ITERS: AtomicU64 = AtomicU64::new(DEFAULT_BURN_ITERS);
 static STOP_AT: AtomicU64 = AtomicU64::new(u64::MAX);
 
+fn init(burn_iters: u64) {
+    BURN_ITERS.store(burn_iters, Ordering::Relaxed);
+}
+
 #[inline(never)]
 fn burn(depth: u64) -> u64 {
     let mut value = depth ^ 0x9e37_79b9_7f4a_7c15;
@@ -31,14 +35,7 @@ fn overflow(depth: u64) -> u64 {
     overflow(depth.wrapping_add(1)).wrapping_add(1)
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn init(burn_iters: u64) {
-    BURN_ITERS.store(burn_iters, Ordering::Relaxed);
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn fib(n: u64) -> u64 {
+#[runtime::fail_child_component]
+fn fib(n: u64) -> u64 {
     overflow(n)
 }
-
-fn main() {}

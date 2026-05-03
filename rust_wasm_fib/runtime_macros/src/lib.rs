@@ -30,6 +30,47 @@ pub fn component(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+#[proc_macro_attribute]
+pub fn fail_child_component(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let config = parse_macro_input!(attr as ComponentConfig);
+    let function = parse_macro_input!(item as ItemFn);
+    let export = function.sig.ident.clone();
+    let ComponentConfig {
+        world,
+        path,
+        component,
+    } = config.with_default_world("fail-child");
+    let component_items = fail_child_component_items(&world, path.as_ref(), &export, &component);
+
+    quote! {
+        #function
+
+        #component_items
+    }
+    .into()
+}
+
+#[proc_macro_attribute]
+pub fn fail_supervisor_component(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let config = parse_macro_input!(attr as ComponentConfig);
+    let function = parse_macro_input!(item as ItemFn);
+    let export = function.sig.ident.clone();
+    let ComponentConfig {
+        world,
+        path,
+        component,
+    } = config.with_default_world("fail-supervisor");
+    let component_items =
+        fail_supervisor_component_items(&world, path.as_ref(), &export, &component);
+
+    quote! {
+        #function
+
+        #component_items
+    }
+    .into()
+}
+
 fn component_items(
     world: &LitStr,
     path: Option<&LitStr>,
@@ -54,6 +95,82 @@ fn component_items(
         #[derive(runtime::Guest)]
         #[runtime(exports(#(#exports),*))]
         struct #component;
+
+        export!(#component);
+    }
+}
+
+fn fail_child_component_items(
+    world: &LitStr,
+    path: Option<&LitStr>,
+    export: &Ident,
+    component: &Ident,
+) -> proc_macro2::TokenStream {
+    let wit_source = match path {
+        Some(path) => quote! { path: #path, },
+        None => {
+            let wit = fail_child_wit(world, export);
+            quote! { inline: #wit, }
+        }
+    };
+
+    quote! {
+        ::wit_bindgen::generate!({
+            world: #world,
+            #wit_source
+            runtime_path: "::wit_bindgen::rt",
+        });
+
+        struct #component;
+
+        impl Guest for #component {
+            fn init(burn_iters: u64) {
+                init(burn_iters)
+            }
+
+            fn #export(n: u64) -> u64 {
+                #export(n)
+            }
+        }
+
+        export!(#component);
+    }
+}
+
+fn fail_supervisor_component_items(
+    world: &LitStr,
+    path: Option<&LitStr>,
+    export: &Ident,
+    component: &Ident,
+) -> proc_macro2::TokenStream {
+    let wit_source = match path {
+        Some(path) => quote! { path: #path, },
+        None => {
+            let wit = fail_supervisor_wit(world, export);
+            quote! { inline: #wit, }
+        }
+    };
+
+    quote! {
+        ::wit_bindgen::generate!({
+            world: #world,
+            #wit_source
+            runtime_path: "::wit_bindgen::rt",
+        });
+
+        struct #component;
+
+        impl Guest for #component {
+            fn #export(n: u64, max_retries: u32) -> (i32, u32, i32, u64) {
+                let report = #export(n, max_retries);
+                (
+                    report.status,
+                    report.attempts,
+                    report.child_status,
+                    report.result,
+                )
+            }
+        }
 
         export!(#component);
     }
@@ -147,6 +264,15 @@ pub fn spawn(input: TokenStream) -> TokenStream {
     .into()
 }
 
+#[proc_macro]
+pub fn run_child(input: TokenStream) -> TokenStream {
+    let input = proc_macro2::TokenStream::from(input);
+    quote! {
+        crate::rust_wasm_runtime::supervisor::runtime::run_child(#input)
+    }
+    .into()
+}
+
 struct ComponentConfig {
     world: LitStr,
     path: Option<LitStr>,
@@ -188,6 +314,19 @@ impl Parse for ComponentConfig {
     }
 }
 
+impl ComponentConfig {
+    fn with_default_world(self, default_world: &str) -> Self {
+        let default_fib_world = LitStr::new("fib-guest", Span::call_site());
+        let world = if self.world.value() == default_fib_world.value() {
+            LitStr::new(default_world, Span::call_site())
+        } else {
+            self.world
+        };
+
+        Self { world, ..self }
+    }
+}
+
 fn component_wit(world: &LitStr, exports: &[Ident]) -> LitStr {
     let exports = exports
         .iter()
@@ -199,7 +338,7 @@ fn component_wit(world: &LitStr, exports: &[Ident]) -> LitStr {
         })
         .collect::<String>();
     let wit = format!(
-        r#"package rust-wasm-fib:fib;
+        r#"package rust-wasm-runtime:process;
 
 interface runtime {{
     resource task;
@@ -221,6 +360,43 @@ world {} {{
 {exports}}}
 "#,
         world.value()
+    );
+
+    LitStr::new(&wit, Span::call_site())
+}
+
+fn fail_child_wit(world: &LitStr, export: &Ident) -> LitStr {
+    let wit = format!(
+        r#"package rust-wasm-runtime:child;
+
+world {} {{
+    export init: func(burn-iters: u64);
+    export {}: func(n: u64) -> u64;
+}}
+"#,
+        world.value(),
+        wit_function_name(export)
+    );
+
+    LitStr::new(&wit, Span::call_site())
+}
+
+fn fail_supervisor_wit(world: &LitStr, export: &Ident) -> LitStr {
+    let wit = format!(
+        r#"package rust-wasm-runtime:supervisor;
+
+interface runtime {{
+    run-child: func(n: u64) -> tuple<s32, u64>;
+}}
+
+world {} {{
+    import runtime;
+
+    export {}: func(n: u64, max-retries: u32) -> tuple<s32, u32, s32, u64>;
+}}
+"#,
+        world.value(),
+        wit_function_name(export)
     );
 
     LitStr::new(&wit, Span::call_site())

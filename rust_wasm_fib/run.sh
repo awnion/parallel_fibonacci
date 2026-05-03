@@ -44,4 +44,10 @@ if [ "${RUST_WASM_FIB_BUILD:-0}" = "1" ] || [ ! -f "$wasm_path" ]; then
   cargo build -p rust_wasm_fib_guest --target wasm32-wasip2 --release
 fi
 
-exec "$host_path" "$n" "$threads" "$wasm_path"
+result="$(
+  "$host_path" run-u64 \
+    "$wasm_path" fib "$n" "$threads" \
+    rust-wasm-runtime:process/runtime
+)"
+
+printf 'Fib %s = %s\n' "$n" "$result"

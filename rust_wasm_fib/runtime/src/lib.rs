@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 wit_bindgen::generate!({
     inline: r#"
-        package rust-wasm-fib:fib;
+        package rust-wasm-runtime:process;
 
         interface runtime {
             resource task;
@@ -24,10 +24,27 @@ wit_bindgen::generate!({
     "#,
 });
 
-use rust_wasm_fib::fib::runtime as wit_runtime;
+use rust_wasm_runtime::process::runtime as wit_runtime;
 
-pub use runtime_macros::{Guest, callable, component, spawn};
+pub use runtime_macros::{
+    Guest, callable, component, fail_child_component, fail_supervisor_component, run_child, spawn,
+};
 pub use wit_runtime::ChildStatus;
+
+pub const STATUS_OK: i32 = 0;
+pub const STATUS_STACK_OVERFLOW: i32 = 1;
+pub const STATUS_TRAP: i32 = 2;
+pub const STATUS_BAD_EXPORT: i32 = 3;
+pub const STATUS_RUNTIME_ERROR: i32 = 4;
+pub const STATUS_SUPERVISOR_FAILED: i32 = 10;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SupervisorReport {
+    pub status: i32,
+    pub attempts: u32,
+    pub child_status: i32,
+    pub result: u64,
+}
 
 pub trait ComponentCall {
     type Output;

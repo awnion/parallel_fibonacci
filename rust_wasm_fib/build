@@ -8,7 +8,7 @@ target_dir="$(
 wit_dir="$target_dir/generated-wit/rust_wasm_fib"
 mkdir -p "$wit_dir"
 cat >"$wit_dir/world.wit" <<'WIT'
-package rust-wasm-fib:fib;
+package rust-wasm-runtime:process;
 
 interface runtime {
     resource task;
@@ -30,10 +30,33 @@ world fib-guest {
     export fib: async func(n: u64) -> u64;
 }
 WIT
+cat >"$wit_dir/fail-child.wit" <<'WIT'
+package rust-wasm-runtime:child;
+
+world fail-child {
+    export init: func(burn-iters: u64);
+    export fib: func(n: u64) -> u64;
+}
+WIT
+cat >"$wit_dir/fail-supervisor.wit" <<'WIT'
+package rust-wasm-runtime:supervisor;
+
+interface runtime {
+    run-child: func(n: u64) -> tuple<s32, u64>;
+}
+
+world fail-supervisor {
+    import runtime;
+
+    export supervise-fib: func(n: u64, max-retries: u32) -> tuple<s32, u32, s32, u64>;
+}
+WIT
 
 cargo build -p rust_wasm_fib_host --release
 cargo build -p rust_wasm_fib_guest --target wasm32-wasip2 --release
-cargo build -p rust_wasm_fib_guest_fail_child --target wasm32-wasip1 --release
-cargo build -p rust_wasm_fib_guest_fail_supervisor --target wasm32-wasip1 --release
+cargo build -p rust_wasm_fib_guest_fail_child --target wasm32-wasip2 --release
+cargo build -p rust_wasm_fib_guest_fail_supervisor --target wasm32-wasip2 --release
 
 printf 'Generated WIT: %s\n' "$wit_dir/world.wit"
+printf 'Generated WIT: %s\n' "$wit_dir/fail-child.wit"
+printf 'Generated WIT: %s\n' "$wit_dir/fail-supervisor.wit"

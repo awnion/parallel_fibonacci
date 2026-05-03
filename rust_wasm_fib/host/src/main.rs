@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use std::env;
 use std::fmt::Display;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Builder;
 use tokio::sync::Notify;
@@ -10,41 +10,38 @@ use wasmtime::component::{
     Accessor, Component as WasmComponent, Linker as ComponentLinker, Resource, ResourceTable,
     ResourceType,
 };
-use wasmtime::{
-    Caller, Config, Engine, Instance, Linker as CoreLinker, Module, Store, StoreContextMut, Trap,
-};
-use wasmtime_wasi::p1::WasiP1Ctx;
+use wasmtime::{Config, Engine, Store, StoreContextMut, Trap};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
-const DEFAULT_N: u64 = 52;
-const DEFAULT_RETRIES: u32 = 3;
-const DEFAULT_FAIL_BURN_ITERS: u64 = 1_700_000;
+const DEFAULT_RUNTIME_IMPORT: &str = "rust-wasm-runtime:process/runtime";
+const DEFAULT_SUPERVISOR_IMPORT: &str = "rust-wasm-runtime:supervisor/runtime";
+const DEFAULT_SUPERVISOR_IMPORT_FUNCTION: &str = "run-child";
+const NO_INIT: &str = "-";
 
-const CHILD_STATUS_OK: i32 = 0;
-const CHILD_STATUS_STACK_OVERFLOW: i32 = 1;
-const CHILD_STATUS_TRAP: i32 = 2;
-const CHILD_STATUS_BAD_EXPORT: i32 = 3;
-const CHILD_STATUS_RUNTIME_ERROR: i32 = 4;
-const CHILD_STATUS_RESULT_WRITE_FAILED: i32 = 5;
-const SUPERVISOR_STATUS_FAILED: i32 = 10;
+const STATUS_OK: i32 = 0;
+const STATUS_STACK_OVERFLOW: i32 = 1;
+const STATUS_TRAP: i32 = 2;
+const STATUS_BAD_EXPORT: i32 = 3;
+const STATUS_RUNTIME_ERROR: i32 = 4;
+const STATUS_SUPERVISOR_FAILED: i32 = 10;
 
 #[derive(Clone, Copy)]
-enum FibStatus {
+enum RunFailure {
     StackOverflow,
     Trap,
     BadExport,
     RuntimeError,
 }
 
-pub struct FibTask {
-    result: Arc<FibTaskResult>,
+pub struct RuntimeTask {
+    result: Arc<TaskResult>,
 }
 
-mod fib_component {
+mod runtime_component {
     wasmtime::component::bindgen!({
-        world: "fib-guest",
+        world: "runtime-client",
         inline: r#"
-            package rust-wasm-fib:fib;
+            package rust-wasm-runtime:process;
 
             interface runtime {
                 resource task;
@@ -60,51 +57,61 @@ mod fib_component {
                 await-task: async func(task: task) -> result<list<u8>, child-status>;
             }
 
-            world fib-guest {
+            world runtime-client {
                 import runtime;
-
-                export fib: async func(n: u64) -> u64;
             }
         "#,
         imports: {
-            "rust-wasm-fib:fib/runtime.await-task": async | trappable | ignore_wit,
+            "rust-wasm-runtime:process/runtime.await-task": async | trappable | ignore_wit,
             default: trappable,
         },
         with: {
-            "rust-wasm-fib:fib/runtime.task": super::FibTask,
+            "rust-wasm-runtime:process/runtime.task": super::RuntimeTask,
         },
     });
 }
 
-use fib_component::rust_wasm_fib::fib::runtime::ChildStatus;
+use runtime_component::rust_wasm_runtime::process::runtime::ChildStatus;
 
-struct FibArgs {
-    n: u64,
+struct RunArgs {
+    component_path: PathBuf,
+    function: String,
+    arg: u64,
     workers: usize,
-    wasm_path: PathBuf,
+    runtime_import: String,
 }
 
-struct FailDemoArgs {
-    n: u64,
-    retries: u32,
+#[derive(Clone)]
+struct ChildInit {
+    function: String,
+    arg: u64,
+}
+
+struct SuperviseArgs {
     supervisor_path: PathBuf,
+    supervisor_function: String,
     child_path: PathBuf,
-    burn_iters: u64,
+    child_function: String,
+    arg: u64,
+    retries: u32,
+    child_init: Option<ChildInit>,
+    runtime_import: String,
+    runtime_function: String,
 }
 
 enum Command {
-    Fib(FibArgs),
-    FailDemo(FailDemoArgs),
+    Run(RunArgs),
+    Supervise(SuperviseArgs),
 }
 
-struct FibComponentState {
+struct RuntimeComponentState {
     wasi: WasiCtx,
     table: ResourceTable,
-    runtime: Arc<FibRuntime>,
+    runtime: Arc<ComponentRuntime>,
 }
 
-impl FibComponentState {
-    fn new(runtime: Arc<FibRuntime>) -> Self {
+impl RuntimeComponentState {
+    fn new(runtime: Arc<ComponentRuntime>) -> Self {
         let wasi = WasiCtx::builder().inherit_stderr().build();
         Self {
             wasi,
@@ -114,7 +121,7 @@ impl FibComponentState {
     }
 }
 
-impl WasiView for FibComponentState {
+impl WasiView for RuntimeComponentState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.wasi,
@@ -123,42 +130,72 @@ impl WasiView for FibComponentState {
     }
 }
 
-struct ChildState {
-    wasi: WasiP1Ctx,
+struct PlainComponentState {
+    wasi: WasiCtx,
+    table: ResourceTable,
 }
 
-impl ChildState {
+impl PlainComponentState {
     fn new() -> Self {
-        let wasi = WasiCtx::builder().inherit_stderr().build_p1();
-        Self { wasi }
+        let wasi = WasiCtx::builder().inherit_stderr().build();
+        Self {
+            wasi,
+            table: ResourceTable::new(),
+        }
     }
 }
 
-struct FailChildRuntime {
+impl WasiView for PlainComponentState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+struct ChildRuntime {
     engine: Engine,
-    module: Module,
-    linker: Arc<CoreLinker<ChildState>>,
-    burn_iters: u64,
+    component: WasmComponent,
+    linker: Arc<ComponentLinker<PlainComponentState>>,
+    function: String,
+    init: Option<ChildInit>,
 }
 
-struct FailSupervisorState {
-    wasi: WasiP1Ctx,
-    child: Arc<FailChildRuntime>,
+struct SupervisorState {
+    wasi: WasiCtx,
+    table: ResourceTable,
+    child: Arc<ChildRuntime>,
+    runtime_function: String,
 }
 
-impl FailSupervisorState {
-    fn new(child: Arc<FailChildRuntime>) -> Self {
-        let wasi = WasiCtx::builder().inherit_stderr().build_p1();
-        Self { wasi, child }
+impl SupervisorState {
+    fn new(child: Arc<ChildRuntime>, runtime_function: String) -> Self {
+        let wasi = WasiCtx::builder().inherit_stderr().build();
+        Self {
+            wasi,
+            table: ResourceTable::new(),
+            child,
+            runtime_function,
+        }
     }
 }
 
-struct FibTaskResult {
-    value: Mutex<Option<std::result::Result<Vec<u8>, FibStatus>>>,
+impl WasiView for SupervisorState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+struct TaskResult {
+    value: Mutex<Option<std::result::Result<Vec<u8>, RunFailure>>>,
     ready: Notify,
 }
 
-impl FibTaskResult {
+impl TaskResult {
     fn new() -> Self {
         Self {
             value: Mutex::new(None),
@@ -166,18 +203,18 @@ impl FibTaskResult {
         }
     }
 
-    fn complete(&self, value: std::result::Result<Vec<u8>, FibStatus>) {
-        *self.value.lock().expect("fib job result mutex poisoned") = Some(value);
+    fn complete(&self, value: std::result::Result<Vec<u8>, RunFailure>) {
+        *self.value.lock().expect("task result mutex poisoned") = Some(value);
         self.ready.notify_waiters();
     }
 
-    async fn wait(&self) -> std::result::Result<Vec<u8>, FibStatus> {
+    async fn wait(&self) -> std::result::Result<Vec<u8>, RunFailure> {
         loop {
             let ready = self.ready.notified();
             if let Some(value) = self
                 .value
                 .lock()
-                .expect("fib job result mutex poisoned")
+                .expect("task result mutex poisoned")
                 .clone()
             {
                 return value;
@@ -187,47 +224,15 @@ impl FibTaskResult {
     }
 }
 
-struct FibRuntime {
+struct ComponentRuntime {
     engine: Engine,
-    instance_pre: Arc<wasmtime::component::InstancePre<FibComponentState>>,
+    instance_pre: Arc<wasmtime::component::InstancePre<RuntimeComponentState>>,
 }
 
 fn default_threads() -> usize {
     std::thread::available_parallelism()
         .map(NonZeroUsize::get)
         .unwrap_or(1)
-}
-
-fn workspace_root() -> PathBuf {
-    let host_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    host_dir
-        .parent()
-        .expect("host crate should be inside the workspace")
-        .to_path_buf()
-}
-
-fn default_fib_guest_path() -> PathBuf {
-    workspace_root()
-        .join("target")
-        .join("wasm32-wasip2")
-        .join("release")
-        .join("rust_wasm_fib_guest.wasm")
-}
-
-fn default_fail_supervisor_path() -> PathBuf {
-    workspace_root()
-        .join("target")
-        .join("wasm32-wasip1")
-        .join("release")
-        .join("rust_wasm_fib_guest_fail_supervisor.wasm")
-}
-
-fn default_fail_child_path() -> PathBuf {
-    workspace_root()
-        .join("target")
-        .join("wasm32-wasip1")
-        .join("release")
-        .join("rust_wasm_fib_guest_fail_child.wasm")
 }
 
 fn with_wasmtime_context<T>(
@@ -251,70 +256,109 @@ fn decode_u64(payload: &[u8]) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn parse_command() -> Command {
+fn parse_command() -> Result<Command> {
     let args: Vec<String> = env::args().skip(1).collect();
-
-    if args.first().is_some_and(|arg| arg == "fail-demo") {
-        let n = args
-            .get(1)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(DEFAULT_N);
-        let retries = args
-            .get(2)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(DEFAULT_RETRIES);
-        let supervisor_path = args
-            .get(3)
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("RUST_WASM_FIB_FAIL_SUPERVISOR").map(PathBuf::from))
-            .unwrap_or_else(default_fail_supervisor_path);
-        let child_path = args
-            .get(4)
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("RUST_WASM_FIB_FAIL_CHILD").map(PathBuf::from))
-            .unwrap_or_else(default_fail_child_path);
-        let burn_iters = args
-            .get(5)
-            .and_then(|value| value.parse().ok())
-            .or_else(|| {
-                env::var("RUST_WASM_FIB_FAIL_BURN_ITERS")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-            })
-            .unwrap_or(DEFAULT_FAIL_BURN_ITERS);
-
-        return Command::FailDemo(FailDemoArgs {
-            n,
-            retries,
-            supervisor_path,
-            child_path,
-            burn_iters,
-        });
+    match args.first().map(String::as_str) {
+        Some("run-u64") => parse_run_command(&args[1..]),
+        Some("supervise-u64") => parse_supervise_command(&args[1..]),
+        _ => bail!(
+            "usage:\n  run-u64 <component> <function> <arg> [workers] [runtime-import]\n  supervise-u64 <supervisor> <supervisor-function> <child> <child-function> <arg> <retries> <child-init-function|-> <child-init-arg> [runtime-import] [runtime-function]"
+        ),
     }
-
-    let n = args
-        .first()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_N);
-    let workers = args
-        .get(1)
-        .and_then(|value| value.parse().ok())
-        .filter(|workers| *workers > 0)
-        .unwrap_or_else(default_threads);
-    let wasm_path = args
-        .get(2)
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("RUST_WASM_FIB_GUEST").map(PathBuf::from))
-        .unwrap_or_else(default_fib_guest_path);
-
-    Command::Fib(FibArgs {
-        n,
-        workers,
-        wasm_path,
-    })
 }
 
-fn build_component_engine() -> Result<Engine> {
+fn parse_run_command(args: &[String]) -> Result<Command> {
+    let component_path = arg_path(args, 0, "component")?;
+    let function = arg_string(args, 1, "function")?;
+    let arg = arg_parse(args, 2, "arg")?;
+    let workers = args
+        .get(3)
+        .map(|value| parse_named(value, "workers"))
+        .transpose()?
+        .filter(|workers| *workers > 0)
+        .unwrap_or_else(default_threads);
+    let runtime_import = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_RUNTIME_IMPORT.to_string());
+
+    Ok(Command::Run(RunArgs {
+        component_path,
+        function,
+        arg,
+        workers,
+        runtime_import,
+    }))
+}
+
+fn parse_supervise_command(args: &[String]) -> Result<Command> {
+    let supervisor_path = arg_path(args, 0, "supervisor")?;
+    let supervisor_function = arg_string(args, 1, "supervisor-function")?;
+    let child_path = arg_path(args, 2, "child")?;
+    let child_function = arg_string(args, 3, "child-function")?;
+    let arg = arg_parse(args, 4, "arg")?;
+    let retries = arg_parse(args, 5, "retries")?;
+    let init_function = arg_string(args, 6, "child-init-function")?;
+    let init_arg = arg_parse(args, 7, "child-init-arg")?;
+    let runtime_import = args
+        .get(8)
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_SUPERVISOR_IMPORT.to_string());
+    let runtime_function = args
+        .get(9)
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_SUPERVISOR_IMPORT_FUNCTION.to_string());
+    let child_init = (init_function != NO_INIT).then_some(ChildInit {
+        function: init_function,
+        arg: init_arg,
+    });
+
+    Ok(Command::Supervise(SuperviseArgs {
+        supervisor_path,
+        supervisor_function,
+        child_path,
+        child_function,
+        arg,
+        retries,
+        child_init,
+        runtime_import,
+        runtime_function,
+    }))
+}
+
+fn arg_string(args: &[String], index: usize, name: &str) -> Result<String> {
+    args.get(index)
+        .cloned()
+        .ok_or_else(|| anyhow!("missing argument: {name}"))
+}
+
+fn arg_path(args: &[String], index: usize, name: &str) -> Result<PathBuf> {
+    Ok(PathBuf::from(arg_string(args, index, name)?))
+}
+
+fn arg_parse<T>(args: &[String], index: usize, name: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: Display,
+{
+    parse_named(
+        args.get(index)
+            .ok_or_else(|| anyhow!("missing argument: {name}"))?,
+        name,
+    )
+}
+
+fn parse_named<T>(value: &str, name: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: Display,
+{
+    value
+        .parse()
+        .map_err(|error| anyhow!("invalid {name} value {value:?}: {error}"))
+}
+
+fn build_async_component_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
@@ -322,63 +366,37 @@ fn build_component_engine() -> Result<Engine> {
     config.wasm_component_model_async_stackful(true);
     with_wasmtime_context(
         Engine::new(&config),
-        "failed to create Wasmtime component engine",
+        "failed to create Wasmtime async component engine",
     )
 }
 
-fn build_engine_with_stack(max_wasm_stack: Option<usize>) -> Result<Engine> {
+fn build_sync_component_engine(max_wasm_stack: Option<usize>) -> Result<Engine> {
     let mut config = Config::new();
+    config.wasm_component_model(true);
     if let Some(max_wasm_stack) = max_wasm_stack {
         config.max_wasm_stack(max_wasm_stack);
     }
-    with_wasmtime_context(Engine::new(&config), "failed to create Wasmtime engine")
+    with_wasmtime_context(
+        Engine::new(&config),
+        "failed to create Wasmtime sync component engine",
+    )
 }
 
-fn call_guest_start<T>(store: &mut Store<T>, instance: &Instance) -> Result<()> {
-    if let Some(initialize) = instance.get_func(&mut *store, "_initialize") {
-        let initialize = with_wasmtime_context(
-            initialize.typed::<(), ()>(&mut *store),
-            "guest _initialize export has an unexpected signature",
-        )?;
-        with_wasmtime_context(initialize.call(&mut *store, ()), "guest _initialize failed")?;
-    } else if let Some(start) = instance.get_func(&mut *store, "_start") {
-        let start = with_wasmtime_context(
-            start.typed::<(), ()>(&mut *store),
-            "guest _start export has an unexpected signature",
-        )?;
-        with_wasmtime_context(start.call(&mut *store, ()), "guest _start failed")?;
-    }
-
-    Ok(())
-}
-
-fn write_caller_u64<T>(
-    caller: &mut Caller<'_, T>,
-    result_ptr: u32,
-    result: u64,
-) -> std::result::Result<(), String> {
-    let memory = caller
-        .get_export("memory")
-        .and_then(|export| export.into_memory())
-        .ok_or_else(|| "guest module does not export memory".to_string())?;
-
-    memory
-        .write(caller, result_ptr as usize, &result.to_le_bytes())
-        .map_err(|error| format!("failed to write u64 into guest memory: {error}"))
-}
-
-fn add_fib_component_imports(linker: &mut ComponentLinker<FibComponentState>) -> Result<()> {
+fn add_runtime_imports(
+    linker: &mut ComponentLinker<RuntimeComponentState>,
+    runtime_import: &str,
+) -> Result<()> {
     let mut instance = with_wasmtime_context(
-        linker.instance("rust-wasm-fib:fib/runtime"),
-        "failed to create fib runtime import instance",
+        linker.instance(runtime_import),
+        format!("failed to create runtime import instance {runtime_import}"),
     )?;
 
     with_wasmtime_context(
         instance.resource(
             "task",
-            ResourceType::host::<FibTask>(),
+            ResourceType::host::<RuntimeTask>(),
             |mut store, rep| -> wasmtime::Result<()> {
-                let task = Resource::<FibTask>::new_own(rep);
+                let task = Resource::<RuntimeTask>::new_own(rep);
                 store.data_mut().table.delete(task)?;
                 Ok(())
             },
@@ -389,11 +407,11 @@ fn add_fib_component_imports(linker: &mut ComponentLinker<FibComponentState>) ->
     with_wasmtime_context(
         instance.func_wrap(
             "spawn",
-            |mut caller: StoreContextMut<'_, FibComponentState>,
+            |mut caller: StoreContextMut<'_, RuntimeComponentState>,
              (function, payload): (String, Vec<u8>)| {
                 let runtime = caller.data().runtime.clone();
                 let result = runtime.spawn_component(function, payload);
-                Ok((caller.data_mut().table.push(FibTask { result })?,))
+                Ok((caller.data_mut().table.push(RuntimeTask { result })?,))
             },
         ),
         "failed to link runtime.spawn import",
@@ -402,14 +420,14 @@ fn add_fib_component_imports(linker: &mut ComponentLinker<FibComponentState>) ->
     with_wasmtime_context(
         instance.func_wrap_concurrent(
             "await-task",
-            |caller: &Accessor<FibComponentState>, (task,): (Resource<FibTask>,)| {
+            |caller: &Accessor<RuntimeComponentState>, (task,): (Resource<RuntimeTask>,)| {
                 Box::pin(async move {
                     let task = caller.with(|mut access| access.get().table.delete(task))?;
                     let result = task
                         .result
                         .wait()
                         .await
-                        .map_err(FibStatus::into_child_status);
+                        .map_err(RunFailure::into_child_status);
                     Ok((result,))
                 })
             },
@@ -420,18 +438,18 @@ fn add_fib_component_imports(linker: &mut ComponentLinker<FibComponentState>) ->
     Ok(())
 }
 
-impl FibRuntime {
-    fn new(engine: Engine, component: &WasmComponent) -> Result<Arc<Self>> {
-        let mut linker = ComponentLinker::<FibComponentState>::new(&engine);
+impl ComponentRuntime {
+    fn new(engine: Engine, component: &WasmComponent, runtime_import: &str) -> Result<Arc<Self>> {
+        let mut linker = ComponentLinker::<RuntimeComponentState>::new(&engine);
         with_wasmtime_context(
             wasmtime_wasi::p2::add_to_linker_async(&mut linker),
-            "failed to link fib guest WASIp2 imports",
+            "failed to link component WASIp2 imports",
         )?;
-        add_fib_component_imports(&mut linker)?;
+        add_runtime_imports(&mut linker, runtime_import)?;
 
         let instance_pre = with_wasmtime_context(
             linker.instantiate_pre(component),
-            "failed to pre-instantiate fib guest module",
+            "failed to pre-instantiate component",
         )?;
 
         Ok(Arc::new(Self {
@@ -440,8 +458,8 @@ impl FibRuntime {
         }))
     }
 
-    fn spawn_component(self: &Arc<Self>, function: String, payload: Vec<u8>) -> Arc<FibTaskResult> {
-        let result = Arc::new(FibTaskResult::new());
+    fn spawn_component(self: &Arc<Self>, function: String, payload: Vec<u8>) -> Arc<TaskResult> {
+        let result = Arc::new(TaskResult::new());
         let task_result = result.clone();
         let runtime = self.clone();
 
@@ -451,7 +469,7 @@ impl FibRuntime {
                 .await
                 .map_err(|error| {
                     println!("runtime.spawn: child {function} failed: {error}");
-                    classify_fib_error(&error)
+                    classify_run_error(&error)
                 });
             task_result.complete(value);
         });
@@ -459,8 +477,10 @@ impl FibRuntime {
         result
     }
 
-    async fn call_fib(self: &Arc<Self>, n: u64) -> Result<u64> {
-        let payload = self.call_component_export("fib", &encode_u64(n)).await?;
+    async fn call_export(self: &Arc<Self>, function: &str, arg: u64) -> Result<u64> {
+        let payload = self
+            .call_component_export(function, &encode_u64(arg))
+            .await?;
         decode_u64(&payload)
     }
 
@@ -469,296 +489,309 @@ impl FibRuntime {
         function: &str,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
-        let n = decode_u64(payload)?;
-        let mut store = Store::new(&self.engine, FibComponentState::new(self.clone()));
+        let arg = decode_u64(payload)?;
+        let mut store = Store::new(&self.engine, RuntimeComponentState::new(self.clone()));
         let instance = with_wasmtime_context(
             self.instance_pre.instantiate_async(&mut store).await,
-            "failed to instantiate fib guest process",
+            "failed to instantiate component process",
         )?;
 
         let func = instance
             .get_func(&mut store, function)
-            .ok_or_else(|| anyhow!("guest component does not export {function}(n: u64) -> u64"))?;
+            .ok_or_else(|| anyhow!("component does not export {function}(u64) -> u64"))?;
         let func = with_wasmtime_context(
             func.typed::<(u64,), (u64,)>(&store),
-            format!("guest export {function} has an unexpected signature"),
+            format!("component export {function} has an unexpected signature"),
         )?;
         let value = with_wasmtime_context(
             store
-                .run_concurrent(async |accessor| func.call_concurrent(accessor, (n,)).await)
+                .run_concurrent(async |accessor| func.call_concurrent(accessor, (arg,)).await)
                 .await,
-            format!("guest {function} event loop failed"),
+            format!("component {function} event loop failed"),
         )??;
         Ok(encode_u64(value.0))
     }
 }
 
-impl FibStatus {
+impl RunFailure {
     fn into_child_status(self) -> ChildStatus {
         match self {
-            FibStatus::StackOverflow => ChildStatus::StackOverflow,
-            FibStatus::Trap => ChildStatus::Trap,
-            FibStatus::BadExport => ChildStatus::BadExport,
-            FibStatus::RuntimeError => ChildStatus::RuntimeError,
+            RunFailure::StackOverflow => ChildStatus::StackOverflow,
+            RunFailure::Trap => ChildStatus::Trap,
+            RunFailure::BadExport => ChildStatus::BadExport,
+            RunFailure::RuntimeError => ChildStatus::RuntimeError,
         }
     }
 }
 
-fn classify_fib_error(error: &anyhow::Error) -> FibStatus {
+fn classify_run_error(error: &anyhow::Error) -> RunFailure {
     if matches!(error.downcast_ref::<Trap>(), Some(Trap::StackOverflow)) {
-        return FibStatus::StackOverflow;
+        return RunFailure::StackOverflow;
     }
 
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("call stack exhausted") || message.contains("stack overflow") {
-        FibStatus::StackOverflow
+        RunFailure::StackOverflow
     } else if message.contains("does not export") {
-        FibStatus::BadExport
+        RunFailure::BadExport
     } else if error.downcast_ref::<wasmtime::Error>().is_some() {
-        FibStatus::Trap
+        RunFailure::Trap
     } else {
-        FibStatus::RuntimeError
+        RunFailure::RuntimeError
     }
 }
 
-async fn run_wasm_fib(args: &FibArgs) -> Result<u64> {
-    let engine = build_component_engine()?;
+async fn run_component(args: &RunArgs) -> Result<u64> {
+    ensure_path(&args.component_path, "component")?;
+    let engine = build_async_component_engine()?;
     let component = with_wasmtime_context(
-        WasmComponent::from_file(&engine, &args.wasm_path),
-        format!(
-            "failed to load guest component {}",
-            args.wasm_path.display()
-        ),
+        WasmComponent::from_file(&engine, &args.component_path),
+        format!("failed to load component {}", args.component_path.display()),
     )?;
-    let runtime = FibRuntime::new(engine, &component)?;
+    let runtime = ComponentRuntime::new(engine, &component, &args.runtime_import)?;
 
-    runtime.call_fib(args.n).await
+    runtime.call_export(&args.function, args.arg).await
 }
 
-fn child_status_name(status: i32) -> &'static str {
+fn status_name(status: i32) -> &'static str {
     match status {
-        CHILD_STATUS_OK => "ok",
-        CHILD_STATUS_STACK_OVERFLOW => "stack-overflow",
-        CHILD_STATUS_TRAP => "trap",
-        CHILD_STATUS_BAD_EXPORT => "bad-export",
-        CHILD_STATUS_RUNTIME_ERROR => "runtime-error",
-        CHILD_STATUS_RESULT_WRITE_FAILED => "result-write-failed",
-        SUPERVISOR_STATUS_FAILED => "supervisor-failed",
+        STATUS_OK => "ok",
+        STATUS_STACK_OVERFLOW => "stack-overflow",
+        STATUS_TRAP => "trap",
+        STATUS_BAD_EXPORT => "bad-export",
+        STATUS_RUNTIME_ERROR => "runtime-error",
+        STATUS_SUPERVISOR_FAILED => "supervisor-failed",
         _ => "unknown",
     }
 }
 
 fn classify_child_error(error: &wasmtime::Error) -> i32 {
     if matches!(error.downcast_ref::<Trap>(), Some(Trap::StackOverflow)) {
-        return CHILD_STATUS_STACK_OVERFLOW;
+        return STATUS_STACK_OVERFLOW;
     }
 
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("call stack exhausted") || message.contains("stack overflow") {
-        CHILD_STATUS_STACK_OVERFLOW
+        STATUS_STACK_OVERFLOW
     } else {
-        CHILD_STATUS_TRAP
+        STATUS_TRAP
     }
 }
 
-impl FailChildRuntime {
-    fn new(engine: &Engine, child_path: &PathBuf, burn_iters: u64) -> Result<Self> {
-        let module = with_wasmtime_context(
-            Module::from_file(engine, child_path),
-            format!("failed to load fail child module {}", child_path.display()),
+impl ChildRuntime {
+    fn new(
+        engine: &Engine,
+        component_path: &PathBuf,
+        function: String,
+        init: Option<ChildInit>,
+    ) -> Result<Self> {
+        let component = with_wasmtime_context(
+            WasmComponent::from_file(engine, component_path),
+            format!(
+                "failed to load child component {}",
+                component_path.display()
+            ),
         )?;
 
-        let mut linker = CoreLinker::<ChildState>::new(engine);
+        let mut linker = ComponentLinker::<PlainComponentState>::new(engine);
         with_wasmtime_context(
-            wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state| &mut state.wasi),
-            "failed to link fail child WASIp1 imports",
+            wasmtime_wasi::p2::add_to_linker_sync(&mut linker),
+            "failed to link child WASIp2 imports",
         )?;
 
         Ok(Self {
             engine: engine.clone(),
-            module,
+            component,
             linker: Arc::new(linker),
-            burn_iters,
+            function,
+            init,
         })
     }
 
-    fn run_fib(&self, n: u64) -> std::result::Result<u64, (i32, String)> {
-        let mut store = Store::new(&self.engine, ChildState::new());
+    fn run_child(&self, arg: u64) -> std::result::Result<u64, (i32, String)> {
+        let mut store = Store::new(&self.engine, PlainComponentState::new());
         let instance = self
             .linker
-            .instantiate(&mut store, &self.module)
+            .instantiate(&mut store, &self.component)
             .map_err(|error| {
                 (
-                    CHILD_STATUS_RUNTIME_ERROR,
-                    format!("failed to instantiate fail child: {error}"),
+                    STATUS_RUNTIME_ERROR,
+                    format!("failed to instantiate child component: {error}"),
                 )
             })?;
 
-        call_guest_start(&mut store, &instance).map_err(|error| {
-            (
-                CHILD_STATUS_RUNTIME_ERROR,
-                format!("fail child startup failed: {error}"),
-            )
-        })?;
-
-        if let Some(init) = instance.get_func(&mut store, "init") {
-            let init = init.typed::<u64, ()>(&mut store).map_err(|error| {
+        if let Some(init) = &self.init {
+            let init_func = instance
+                .get_func(&mut store, &init.function)
+                .ok_or_else(|| {
+                    (
+                        STATUS_BAD_EXPORT,
+                        format!("child component does not export {}(u64)", init.function),
+                    )
+                })?;
+            let init_func = init_func.typed::<(u64,), ()>(&store).map_err(|error| {
                 (
-                    CHILD_STATUS_BAD_EXPORT,
-                    format!("fail child init export has invalid signature: {error}"),
+                    STATUS_BAD_EXPORT,
+                    format!(
+                        "child init export {} has invalid signature: {error}",
+                        init.function
+                    ),
                 )
             })?;
-            init.call(&mut store, self.burn_iters).map_err(|error| {
+            init_func.call(&mut store, (init.arg,)).map_err(|error| {
                 (
-                    CHILD_STATUS_RUNTIME_ERROR,
-                    format!("fail child init failed: {error}"),
+                    STATUS_RUNTIME_ERROR,
+                    format!("child init {} failed: {error}", init.function),
                 )
             })?;
         }
 
-        let fib = instance
-            .get_typed_func::<u64, u64>(&mut store, "fib")
-            .map_err(|error| {
+        let func = instance
+            .get_func(&mut store, &self.function)
+            .ok_or_else(|| {
                 (
-                    CHILD_STATUS_BAD_EXPORT,
-                    format!("fail child fib export is missing or invalid: {error}"),
+                    STATUS_BAD_EXPORT,
+                    format!(
+                        "child component does not export {}(u64) -> u64",
+                        self.function
+                    ),
                 )
             })?;
-
-        fib.call(&mut store, n).map_err(|error| {
+        let func = func.typed::<(u64,), (u64,)>(&store).map_err(|error| {
             (
-                classify_child_error(&error),
-                format!("fail child trapped while running fib({n}): {error}"),
+                STATUS_BAD_EXPORT,
+                format!(
+                    "child export {} has invalid signature: {error}",
+                    self.function
+                ),
             )
-        })
+        })?;
+
+        func.call(&mut store, (arg,))
+            .map(|result| result.0)
+            .map_err(|error| {
+                (
+                    classify_child_error(&error),
+                    format!(
+                        "child trapped while running {}({arg}): {error}",
+                        self.function
+                    ),
+                )
+            })
     }
 }
 
-fn add_supervisor_runtime_imports(linker: &mut CoreLinker<FailSupervisorState>) -> Result<()> {
-    with_wasmtime_context(
-        linker
-            .func_wrap(
-                "runtime",
-                "run-fib",
-                |mut caller: Caller<'_, FailSupervisorState>, n: u64, result_ptr: u32| -> i32 {
-                    let child = caller.data().child.clone();
+fn add_supervisor_runtime_imports(
+    linker: &mut ComponentLinker<SupervisorState>,
+    runtime_import: &str,
+    runtime_function: &str,
+) -> Result<()> {
+    let mut instance = with_wasmtime_context(
+        linker.instance(runtime_import),
+        format!("failed to create supervisor runtime import instance {runtime_import}"),
+    )?;
+    let runtime_function_name = runtime_function.to_string();
 
-                    match child.run_fib(n) {
-                        Ok(result) => match write_caller_u64(&mut caller, result_ptr, result) {
-                            Ok(()) => CHILD_STATUS_OK,
-                            Err(error) => {
-                                println!("runtime.run-fib: {error}");
-                                CHILD_STATUS_RESULT_WRITE_FAILED
-                            }
-                        },
-                        Err((status, _error)) => {
-                            println!(
-                                "runtime.run-fib: child status={} ({})",
-                                status,
-                                child_status_name(status)
-                            );
-                            status
-                        }
+    with_wasmtime_context(
+        instance.func_wrap(
+            runtime_function,
+            |caller: StoreContextMut<'_, SupervisorState>, (arg,): (u64,)| {
+                let child = caller.data().child.clone();
+                let runtime_function = caller.data().runtime_function.clone();
+
+                let result = match child.run_child(arg) {
+                    Ok(result) => (STATUS_OK, result),
+                    Err((status, _error)) => {
+                        println!(
+                            "runtime.{runtime_function}: child status={} ({})",
+                            status,
+                            status_name(status)
+                        );
+                        (status, 0)
                     }
-                },
-            )
-            .map(|_| ()),
-        "failed to link supervisor runtime imports",
+                };
+
+                Ok((result,))
+            },
+        ),
+        format!("failed to link supervisor runtime function {runtime_function_name}"),
     )
 }
 
-fn run_fail_demo(args: &FailDemoArgs) -> Result<()> {
-    if !args.supervisor_path.exists() {
-        bail!(
-            "fail supervisor wasm not found at {}. Build it first with: cargo build -p rust_wasm_fib_guest_fail_supervisor --target wasm32-wasip1 --release",
-            args.supervisor_path.display()
-        );
-    }
-    if !args.child_path.exists() {
-        bail!(
-            "fail child wasm not found at {}. Build it first with: cargo build -p rust_wasm_fib_guest_fail_child --target wasm32-wasip1 --release",
-            args.child_path.display()
-        );
-    }
+fn run_supervisor(args: &SuperviseArgs) -> Result<()> {
+    ensure_path(&args.supervisor_path, "supervisor component")?;
+    ensure_path(&args.child_path, "child component")?;
 
-    let engine = build_engine_with_stack(Some(64 * 1024))?;
-    let supervisor_module = with_wasmtime_context(
-        Module::from_file(&engine, &args.supervisor_path),
+    let engine = build_sync_component_engine(Some(64 * 1024))?;
+    let supervisor_component = with_wasmtime_context(
+        WasmComponent::from_file(&engine, &args.supervisor_path),
         format!(
-            "failed to load fail supervisor module {}",
+            "failed to load supervisor component {}",
             args.supervisor_path.display()
         ),
     )?;
-    let child = Arc::new(FailChildRuntime::new(
+    let child = Arc::new(ChildRuntime::new(
         &engine,
         &args.child_path,
-        args.burn_iters,
+        args.child_function.clone(),
+        args.child_init.clone(),
     )?);
 
-    let mut linker = CoreLinker::<FailSupervisorState>::new(&engine);
+    let mut linker = ComponentLinker::<SupervisorState>::new(&engine);
     with_wasmtime_context(
-        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state| &mut state.wasi),
-        "failed to link fail supervisor WASIp1 imports",
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker),
+        "failed to link supervisor WASIp2 imports",
     )?;
-    add_supervisor_runtime_imports(&mut linker)?;
+    add_supervisor_runtime_imports(&mut linker, &args.runtime_import, &args.runtime_function)?;
 
-    let mut store = Store::new(&engine, FailSupervisorState::new(child));
+    let mut store = Store::new(
+        &engine,
+        SupervisorState::new(child, args.runtime_function.clone()),
+    );
     let instance = with_wasmtime_context(
-        linker.instantiate(&mut store, &supervisor_module),
-        "failed to instantiate fail supervisor module",
+        linker.instantiate(&mut store, &supervisor_component),
+        "failed to instantiate supervisor component",
     )?;
-    call_guest_start(&mut store, &instance)?;
 
     let supervise = with_wasmtime_context(
-        instance.get_typed_func::<(u64, u32), i32>(&mut store, "supervise_fib"),
-        "supervisor module does not export supervise_fib(n: u64, retries: u32) -> i32",
+        instance
+            .get_func(&mut store, &args.supervisor_function)
+            .ok_or_else(|| {
+                anyhow!(
+                    "supervisor component does not export {}",
+                    args.supervisor_function
+                )
+            })?
+            .typed::<(u64, u32), ((i32, u32, i32, u64),)>(&store),
+        format!(
+            "supervisor export {} has invalid signature",
+            args.supervisor_function
+        ),
     )?;
-    let supervisor_status = with_wasmtime_context(
-        supervise.call(&mut store, (args.n, args.retries)),
-        "supervisor failed while running supervise_fib",
-    )?;
-
-    let last_attempts = with_wasmtime_context(
-        instance.get_typed_func::<(), u32>(&mut store, "last_attempts"),
-        "supervisor module does not export last_attempts() -> u32",
-    )?;
-    let attempts = with_wasmtime_context(
-        last_attempts.call(&mut store, ()),
-        "failed to read supervisor attempt count",
-    )?;
-
-    let last_child_status = with_wasmtime_context(
-        instance.get_typed_func::<(), i32>(&mut store, "last_child_status"),
-        "supervisor module does not export last_child_status() -> i32",
-    )?;
-    let child_status = with_wasmtime_context(
-        last_child_status.call(&mut store, ()),
-        "failed to read supervisor child status",
-    )?;
-
-    let last_result = with_wasmtime_context(
-        instance.get_typed_func::<(), u64>(&mut store, "last_result"),
-        "supervisor module does not export last_result() -> u64",
-    )?;
-    let result = with_wasmtime_context(
-        last_result.call(&mut store, ()),
-        "failed to read supervisor result",
+    let ((supervisor_status, attempts, child_status, result),) = with_wasmtime_context(
+        supervise.call(&mut store, (args.arg, args.retries)),
+        format!(
+            "supervisor failed while running {}",
+            args.supervisor_function
+        ),
     )?;
 
     println!(
         "Supervisor status = {} ({})",
         supervisor_status,
-        child_status_name(supervisor_status)
+        status_name(supervisor_status)
     );
     println!("Supervisor attempts = {attempts}");
-    println!("Child burn iterations/frame = {}", args.burn_iters);
+    if let Some(init) = &args.child_init {
+        println!("Child init argument = {}", init.arg);
+    }
     println!(
         "Last child status = {} ({})",
         child_status,
-        child_status_name(child_status)
+        status_name(child_status)
     );
-    if supervisor_status == CHILD_STATUS_OK {
-        println!("Fib {} = {}", args.n, result);
+    if supervisor_status == STATUS_OK {
+        println!("Result = {result}");
     } else {
         println!("Runtime survived child traps; supervisor reported failure after retries.");
     }
@@ -766,24 +799,24 @@ fn run_fail_demo(args: &FailDemoArgs) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    match parse_command() {
-        Command::Fib(args) => {
-            if !args.wasm_path.exists() {
-                bail!(
-                    "guest component not found at {}. Build it first with: cargo build -p rust_wasm_fib_guest --target wasm32-wasip2 --release",
-                    args.wasm_path.display()
-                );
-            }
+fn ensure_path(path: &Path, label: &str) -> Result<()> {
+    if !path.exists() {
+        bail!("{label} not found at {}", path.display());
+    }
+    Ok(())
+}
 
+fn main() -> Result<()> {
+    match parse_command()? {
+        Command::Run(args) => {
             let runtime = Builder::new_multi_thread()
                 .worker_threads(args.workers)
                 .enable_all()
                 .build()?;
-            let result = runtime.block_on(run_wasm_fib(&args))?;
-            println!("Fib {} = {}", args.n, result);
+            let result = runtime.block_on(run_component(&args))?;
+            println!("{result}");
             Ok(())
         }
-        Command::FailDemo(args) => run_fail_demo(&args),
+        Command::Supervise(args) => run_supervisor(&args),
     }
 }

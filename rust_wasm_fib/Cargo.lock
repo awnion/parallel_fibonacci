@@ -1274,10 +1274,18 @@ dependencies = [
 [[package]]
 name = "rust_wasm_fib_guest_fail_child"
 version = "0.1.0"
+dependencies = [
+ "rust_wasm_fib_runtime",
+ "wit-bindgen",
+]
 
 [[package]]
 name = "rust_wasm_fib_guest_fail_supervisor"
 version = "0.1.0"
+dependencies = [
+ "rust_wasm_fib_runtime",
+ "wit-bindgen",
+]
 
 [[package]]
 name = "rust_wasm_fib_host"

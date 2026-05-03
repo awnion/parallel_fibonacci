@@ -1,6 +1,6 @@
 # Rust WASM Fibonacci
 
-Native Rust host plus Rust WASM component implementation of the parallel
+Generic native Rust host plus Rust WASM component implementation of the parallel
 Fibonacci example.
 
 The normal guest is a WASI Preview 2 component with Preview 3 async component
@@ -31,9 +31,16 @@ marker, `impl Guest`, `export!(Component)`, and the hidden typed call
 descriptor/codec.
 `runtime::spawn!` expands to that descriptor, so a missing callable or
 unsupported signature fails at compile time. For this POC the supported
-callable/export signature is `async fn(u64) -> u64`, and the host dynamically
-looks up the exported component function by name before calling it in a fresh
-Store/Instance.
+callable/export signature is `async fn(u64) -> u64`.
+
+The host is not tied to this component. The scripts pass component paths,
+export names, runtime import names, and arguments into the generic host commands:
+
+```sh
+rust_wasm_fib_host run-u64 <component> <function> <arg> [workers] [runtime-import]
+rust_wasm_fib_host supervise-u64 <supervisor> <supervisor-fn> <child> <child-fn> \
+  <arg> <retries> <child-init-fn|-> <child-init-arg> [runtime-import] [runtime-fn]
+```
 
 ## Build
 
@@ -43,11 +50,11 @@ Build all prebuilt artifacts:
 ./build
 ```
 
-This builds the native host once, the normal component guest, and the WASIp1
-fail-demo guests.
+This builds the native host once, the normal component guest, and the fail-demo
+component guests.
 
-It also writes a WIT copy for external tooling, for example Python bindings, to
-`target/generated-wit/rust_wasm_fib/world.wit`.
+It also writes WIT copies for external tooling, for example Python bindings, to
+`target/generated-wit/rust_wasm_fib/`.
 
 ## Run
 
@@ -69,9 +76,9 @@ also set `RUST_WASM_FIB_THREADS`.
 
 ## Stack Overflow Supervisor Demo
 
-The fail demo still uses core WASIp1 modules. A WASM supervisor calls a
-host-provided `runtime.run-fib` import. The host import creates a fresh isolated
-child WASM instance, calls its exported `fib(n)`, catches
+The fail demo uses two WASIp2 components. A WASM supervisor calls a
+host-provided `runtime.run-child` component import. The host import creates a fresh
+isolated child component instance, calls its exported `fib(n)`, catches
 `Trap::StackOverflow`, drops that child instance, and returns a status code to
 the supervisor.
 
