@@ -26,8 +26,8 @@ if [ "${RUST_WASM_FIB_BUILD:-0}" = "1" ] || [ ! -f "$supervisor_path" ]; then
   cargo build -p rust_wasm_fib_guest_fail_supervisor --target wasm32-wasip2 --release
 fi
 
-exec "$host_path" supervise-u64 \
+exec "$host_path" spawn-link-u64 \
   "$supervisor_path" supervise-fib \
   "$child_path" fib \
   "$n" "$retries" init "$burn_iters" \
-  rust-wasm-runtime:supervisor/runtime run-child
+  rust-wasm-runtime:supervisor/runtime spawn-link

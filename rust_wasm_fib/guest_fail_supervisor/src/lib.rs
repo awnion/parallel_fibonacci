@@ -1,7 +1,7 @@
 #[runtime::fail_supervisor_component]
 fn supervise_fib(n: u64, max_retries: u32) -> runtime::SupervisorReport {
     for attempt in 1..=max_retries {
-        let (child_status, result) = runtime::run_child!(n);
+        let (child_status, result) = runtime::spawn_link!(n);
 
         if child_status == runtime::STATUS_OK {
             return runtime::SupervisorReport {

@@ -265,10 +265,10 @@ pub fn spawn(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
-pub fn run_child(input: TokenStream) -> TokenStream {
+pub fn spawn_link(input: TokenStream) -> TokenStream {
     let input = proc_macro2::TokenStream::from(input);
     quote! {
-        crate::rust_wasm_runtime::supervisor::runtime::run_child(#input)
+        crate::rust_wasm_runtime::supervisor::runtime::spawn_link(#input)
     }
     .into()
 }
@@ -386,7 +386,7 @@ fn fail_supervisor_wit(world: &LitStr, export: &Ident) -> LitStr {
         r#"package rust-wasm-runtime:supervisor;
 
 interface runtime {{
-    run-child: func(n: u64) -> tuple<s32, u64>;
+    spawn-link: func(n: u64) -> tuple<s32, u64>;
 }}
 
 world {} {{

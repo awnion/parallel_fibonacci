@@ -27,7 +27,7 @@ wit_bindgen::generate!({
 use rust_wasm_runtime::process::runtime as wit_runtime;
 
 pub use runtime_macros::{
-    Guest, callable, component, fail_child_component, fail_supervisor_component, run_child, spawn,
+    Guest, callable, component, fail_child_component, fail_supervisor_component, spawn, spawn_link,
 };
 pub use wit_runtime::ChildStatus;
 

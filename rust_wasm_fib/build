@@ -42,7 +42,7 @@ cat >"$wit_dir/fail-supervisor.wit" <<'WIT'
 package rust-wasm-runtime:supervisor;
 
 interface runtime {
-    run-child: func(n: u64) -> tuple<s32, u64>;
+    spawn-link: func(n: u64) -> tuple<s32, u64>;
 }
 
 world fail-supervisor {

@@ -38,7 +38,7 @@ export names, runtime import names, and arguments into the generic host commands
 
 ```sh
 rust_wasm_fib_host run-u64 <component> <function> <arg> [workers] [runtime-import]
-rust_wasm_fib_host supervise-u64 <supervisor> <supervisor-fn> <child> <child-fn> \
+rust_wasm_fib_host spawn-link-u64 <supervisor> <supervisor-fn> <child> <child-fn> \
   <arg> <retries> <child-init-fn|-> <child-init-arg> [runtime-import] [runtime-fn]
 ```
 
@@ -77,10 +77,10 @@ also set `RUST_WASM_FIB_THREADS`.
 ## Stack Overflow Supervisor Demo
 
 The fail demo uses two WASIp2 components. A WASM supervisor calls a
-host-provided `runtime.run-child` component import. The host import creates a fresh
-isolated child component instance, calls its exported `fib(n)`, catches
-`Trap::StackOverflow`, drops that child instance, and returns a status code to
-the supervisor.
+host-provided `runtime.spawn-link` component import. The host import creates a
+fresh isolated child component instance, calls its exported `fib(n)`, catches
+`Trap::StackOverflow`, drops that child instance, and returns an Erlang-style
+linked process status to the supervisor.
 
 ```sh
 ./run_fail_demo.sh 52 3
