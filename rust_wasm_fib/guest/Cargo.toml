@@ -3,7 +3,11 @@ name = "rust_wasm_fib_guest"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
 [dependencies]
-async-executor.workspace = true
 async-recursion.workspace = true
-futures-lite.workspace = true
+runtime = { package = "rust_wasm_fib_runtime", path = "../runtime" }
+wit-bindgen.workspace = true

@@ -29,12 +29,19 @@ detect_threads() {
 n="${1:-52}"
 threads="${2:-$(detect_threads)}"
 
-cargo build -p rust_wasm_fib_guest --target wasm32-wasip1-threads --release
-
 target_dir="$(
   cargo metadata --format-version 1 --no-deps \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
 )"
-wasm_path="$target_dir/wasm32-wasip1-threads/release/rust_wasm_fib_guest.wasm"
+wasm_path="$target_dir/wasm32-wasip2/release/rust_wasm_fib_guest.wasm"
+host_path="$target_dir/release/rust_wasm_fib_host"
 
-exec cargo run -p rust_wasm_fib --release -- "$n" "$threads" "$wasm_path"
+if [ "${RUST_WASM_FIB_BUILD:-0}" = "1" ] || [ ! -x "$host_path" ]; then
+  cargo build -p rust_wasm_fib_host --release
+fi
+
+if [ "${RUST_WASM_FIB_BUILD:-0}" = "1" ] || [ ! -f "$wasm_path" ]; then
+  cargo build -p rust_wasm_fib_guest --target wasm32-wasip2 --release
+fi
+
+exec "$host_path" "$n" "$threads" "$wasm_path"

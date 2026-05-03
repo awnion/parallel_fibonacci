@@ -1,0 +1,12 @@
+[package]
+name = "rust_wasm_fib_runtime"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "runtime"
+path = "src/lib.rs"
+
+[dependencies]
+runtime_macros = { package = "rust_wasm_fib_runtime_macros", path = "../runtime_macros" }
+wit-bindgen.workspace = true

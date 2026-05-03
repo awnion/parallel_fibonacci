@@ -1,5 +1,12 @@
 [workspace]
-members = ["guest", "guest_fail_child", "guest_fail_supervisor", "host"]
+members = [
+  "guest",
+  "guest_fail_child",
+  "guest_fail_supervisor",
+  "host",
+  "runtime",
+  "runtime_macros",
+]
 resolver = "3"
 
 [workspace.package]
@@ -8,12 +15,14 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
-async-executor = "1.14.0"
 async-recursion = "1.1.1"
-futures-lite = "2.6.1"
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "sync"] }
 wasmtime = "44"
 wasmtime-wasi = "44"
-wasmtime-wasi-threads = "44.0.1"
+wit-bindgen = "0.57.1"
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+syn = { version = "2.0.117", features = ["full"] }
 
 [profile.release]
 codegen-units = 1

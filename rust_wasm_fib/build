@@ -1,0 +1,39 @@
+#!/usr/bin/env sh
+set -eu
+
+target_dir="$(
+  cargo metadata --format-version 1 --no-deps \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+)"
+wit_dir="$target_dir/generated-wit/rust_wasm_fib"
+mkdir -p "$wit_dir"
+cat >"$wit_dir/world.wit" <<'WIT'
+package rust-wasm-fib:fib;
+
+interface runtime {
+    resource task;
+
+    enum child-status {
+        stack-overflow,
+        trap,
+        bad-export,
+        runtime-error,
+    }
+
+    spawn: func(function: string, payload: list<u8>) -> task;
+    await-task: async func(task: task) -> result<list<u8>, child-status>;
+}
+
+world fib-guest {
+    import runtime;
+
+    export fib: async func(n: u64) -> u64;
+}
+WIT
+
+cargo build -p rust_wasm_fib_host --release
+cargo build -p rust_wasm_fib_guest --target wasm32-wasip2 --release
+cargo build -p rust_wasm_fib_guest_fail_child --target wasm32-wasip1 --release
+cargo build -p rust_wasm_fib_guest_fail_supervisor --target wasm32-wasip1 --release
+
+printf 'Generated WIT: %s\n' "$wit_dir/world.wit"
